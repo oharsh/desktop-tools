@@ -1,6 +1,6 @@
 # desktop-tools
 
-My Niri desktop setup: floating fuzzy launchers, lock screen and screensaver, tmux, niri config.
+My Niri desktop setup: floating fuzzy launchers, lock screen and screensaver.
 
 | Path | Installed to | What |
 |---|---|---|
@@ -8,8 +8,6 @@ My Niri desktop setup: floating fuzzy launchers, lock screen and screensaver, tm
 | `bin/app-search` | `~/.local/bin` | Floating fuzzy app launcher (`Mod+Y`) |
 | `bin/lock`, `bin/screensaver` | `~/.local/bin` | Quickshell lock screen (`Mod+'`) and screensaver |
 | `bin/niri-run-or-raise`, `bin/toggle-ai` | `~/.local/bin` | Focus-or-launch, scratchpad helpers |
-| `niri/config.kdl` | `~/.config/niri/` | Niri config |
-| `niri/dms/binds.kdl` | *(reference copy)* | DankMaterialShell-managed binds; not symlinked |
 | `quickshell/*` | `~/.config/quickshell/` | Lock + screensaver QML |
 | `tmux/*` | `~/.config/tmux/` | tmux config, guide, sessionizer |
 

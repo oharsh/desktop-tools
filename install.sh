@@ -16,10 +16,8 @@ link() {   # link <repo-relative source> <target>
 for f in file-search app-search lock screensaver niri-run-or-raise toggle-ai toggle-scratchpad; do
   link "bin/$f" "$bin/$f"
 done
-link niri/config.kdl "$cfg/niri/config.kdl"
 link quickshell/lock "$cfg/quickshell/lock"
 link quickshell/screensaver "$cfg/quickshell/screensaver"
 link tmux/tmux.conf "$cfg/tmux/tmux.conf"
 link tmux/GUIDE.md "$cfg/tmux/GUIDE.md"
 link tmux/scripts "$cfg/tmux/scripts"
-# niri/dms/binds.kdl is DankMaterialShell-managed: not linked. Copy it by hand if you use DMS.
