@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""app-search — fuzzy application launcher in a floating window (niri).
+
+  Enter        focus the app if it is already running, otherwise launch it
+               (pressing it on the app you are already in cycles its windows)
+  Ctrl+Enter   always launch a new instance (Shift+Enter does the same)
+  Esc          close        (pressing the launcher key again also closes it)
+
+Apps you launch most float to the top; running apps are marked with a dot.
+Same Material "deep ocean" look as file-search, nvim and tmux.
+"""
+import os
+import sys
+
+HOME = os.path.expanduser("~")
+SELF = os.path.realpath(__file__)
+ICON_CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", HOME + "/.cache"), "app-search", "icons")
+PLACEHOLDER = "\U0010eeee"  # kitty draws an image wherever this character is printed
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", HOME + "/.local/state"), "app-search", "counts")
+OWN_WINDOWS = {"app-search", "file-search"}
+
+KITTY = [
+    "kitty", "--class", "app-search", "--title", "App Search", "--config", "NONE",
+    "-o", "font_family=Hack Nerd Font", "-o", "font_size=14",
+    "-o", "background=#0f111a", "-o", "foreground=#a6accd",
+    "-o", "cursor=#84ffff", "-o", "cursor_shape=beam", "-o", "cursor_blink_interval=0",
+    "-o", "window_padding_width=10 16", "-o", "confirm_os_window_close=0",
+    "-o", "enable_audio_bell=no", "-o", "update_check_interval=0",
+    "-o", r"map ctrl+enter send_text all \x1b[24~",
+    "-o", r"map ctrl+kp_enter send_text all \x1b[24~",
+    "-o", r"map shift+enter send_text all \x1b[24~",
+    "-o", r"map shift+kp_enter send_text all \x1b[24~",
+]
+
+
+def rgb(r, g, b):
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+DIM, FG, RST = rgb(103, 110, 149), rgb(238, 255, 255), "\033[0m"
+CYAN, BLUE, GREEN = rgb(132, 255, 255), rgb(130, 170, 255), rgb(195, 232, 141)
+PURPLE, YELLOW, ORANGE, RED = rgb(199, 146, 234), rgb(255, 203, 107), rgb(247, 140, 108), rgb(240, 113, 120)
+
+# first matching category wins: (category, glyph, colour)
+ICONS = [
+    ("TerminalEmulator", "", GREEN), ("WebBrowser", "", BLUE),
+    ("Development", "", GREEN), ("Game", "", RED),
+    ("AudioVideo", "", YELLOW), ("Audio", "", YELLOW), ("Video", "", YELLOW),
+    ("Graphics", "", PURPLE), ("Office", "", CYAN),
+    ("Network", "", BLUE), ("Settings", "", ORANGE), ("System", "", ORANGE),
+    ("Utility", "", ORANGE),
+]
+DEFAULT_ICON = ("", DIM)
+
+
+# ── desktop entries ───────────────────────────────────────────────────────────
+def app_dirs():
+    data_home = os.environ.get("XDG_DATA_HOME", HOME + "/.local/share")
+    data_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
+    return [os.path.join(d, "applications") for d in [data_home, *data_dirs] if d]
+
+
+def parse(path):
+    """Read the [Desktop Entry] section of a .desktop file into a dict."""
+    entry, inside = {}, False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    if inside:
+                        break
+                    inside = line == "[Desktop Entry]"
+                elif inside and "=" in line and not line.startswith("#"):
+                    key, value = line.split("=", 1)
+                    entry.setdefault(key.strip(), value.strip())
+    except OSError:
+        pass
+    return entry
+
+
+def all_apps():
+    """{desktop id: (path, entry)} — earlier directories override later ones."""
+    apps = {}
+    for base in app_dirs():
+        for dirpath, _, files in os.walk(base):
+            for name in files:
+                if not name.endswith(".desktop"):
+                    continue
+                path = os.path.join(dirpath, name)
+                app_id = os.path.relpath(path, base).replace("/", "-")
+                if app_id not in apps:
+                    apps[app_id] = (path, parse(path))
+    return {
+        i: (p, e) for i, (p, e) in apps.items()
+        if e.get("Type") == "Application" and e.get("Exec") and e.get("Name")
+        and e.get("NoDisplay") != "true" and e.get("Hidden") != "true"
+    }
+
+
+def command(entry):
+    import shlex
+    try:
+        argv = shlex.split(entry.get("Exec", ""))
+    except ValueError:
+        argv = entry.get("Exec", "").split()
+    argv = [a.replace("%%", "%") for a in argv if not (len(a) == 2 and a[0] == "%" and a[1].isalpha())]
+    return argv
+
+
+# ── real app icons (kitty graphics, one tiny image per app) ──────────────────
+def find_icon(name):
+    """Locate the icon file for a desktop entry's Icon= value (svg preferred, else biggest png)."""
+    import glob
+    import re
+    if os.path.isabs(name):
+        return name if os.path.isfile(name) else None
+    data_home = os.environ.get("XDG_DATA_HOME", HOME + "/.local/share")
+    data_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
+    bases = [os.path.join(d, "icons") for d in [data_home, *data_dirs] if d] + [HOME + "/.icons"]
+    best, best_score = None, -1
+    for theme in ("hicolor", "breeze-dark", "Adwaita", "breeze", "*"):
+        for base in bases:
+            for path in glob.glob(f"{base}/{theme}/**/{name}.*", recursive=True):
+                ext = path.rsplit(".", 1)[-1].lower()
+                if ext == "svg":
+                    score = 100000
+                elif ext == "png":
+                    sizes = re.findall(r"/(\d+)x?\d*(?:@\d)?/", path)
+                    score = int(sizes[0]) if sizes else 1
+                else:
+                    continue
+                if score > best_score:
+                    best, best_score = path, score
+        if best:
+            return best
+    for path in [f"{b}/{name}.{e}" for b in ("/usr/share/pixmaps", *bases) for e in ("svg", "png")]:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def icon_png(name):
+    """Path to a cached 96px PNG of the icon, or None. Converted once, then reused."""
+    import subprocess
+    if not name:
+        return None
+    safe = name.replace("/", "_")
+    png, missing = f"{ICON_CACHE}/{safe}.png", f"{ICON_CACHE}/{safe}.none"
+    if os.path.isfile(png):
+        return png
+    if os.path.exists(missing):
+        return None
+    os.makedirs(ICON_CACHE, exist_ok=True)
+    src = find_icon(name) or find_icon(name + "-symbolic")
+    try:
+        if src and src.lower().endswith(".svg"):
+            subprocess.run(["rsvg-convert", "-w", "96", "-h", "96", "-o", png, src], check=True, capture_output=True)
+            if "symbolic" in src:  # one-colour glyphs are drawn dark: tint them to the text colour
+                subprocess.run(["magick", png, "-fill", "#a6accd", "-colorize", "100", png], check=True, capture_output=True)
+        elif src:
+            subprocess.run(["magick", src, "-background", "none", "-resize", "96x96", png], check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    if os.path.isfile(png):
+        return png
+    open(missing, "w").close()
+    return None
+
+
+def icon_ids(apps):
+    """{desktop id: (kitty image number, png path)} — same numbering in --ui and --list."""
+    ids, n = {}, 0
+    for app_id in sorted(apps):
+        png = icon_png(apps[app_id][1].get("Icon", ""))
+        if png and n < 255:
+            n += 1
+            ids[app_id] = (n, png)
+    return ids
+
+
+def send_icons(ids):
+    """Hand every icon to kitty (fzf runs this once at start, on its own screen)."""
+    import base64
+    out = []
+    for n, png in ids.values():
+        path = base64.standard_b64encode(png.encode()).decode()
+        out.append(f"\033_Ga=T,U=1,f=100,t=f,i={n},c=2,r=1,q=2;{path}\033\\")
+    with open("/dev/tty", "w") as tty:
+        tty.write("".join(out))
+
+
+# ── niri windows ──────────────────────────────────────────────────────────────
+def niri_json(what):
+    import json
+    import subprocess
+    try:
+        out = subprocess.run(["niri", "msg", "--json", what], capture_output=True, text=True, timeout=2).stdout
+        return json.loads(out)
+    except Exception:
+        return []
+
+
+def windows():
+    wins = [w for w in niri_json("windows") if (w.get("app_id") or "") not in OWN_WINDOWS]
+    for w in wins:
+        try:
+            with open(f"/proc/{w.get('pid')}/comm") as f:
+                w["_comm"] = f.read().strip().lower()
+        except OSError:
+            w["_comm"] = ""
+    return wins
+
+
+def matching(wins, app_id, entry):
+    """Windows that belong to this app, best match first."""
+    clean = app_id[:-8].lower()
+    targets = {clean}
+    if entry.get("StartupWMClass"):
+        targets.add(entry["StartupWMClass"].lower())
+    argv = command(entry)
+    binary = os.path.basename(argv[0]).lower() if argv else ""
+    # wrappers and browser "web apps" share a binary with other apps: don't match on it
+    if binary in ("env", "sh", "bash", "flatpak", "gtk-launch") or any(a.startswith("--app") for a in argv):
+        binary = ""
+    found = []
+    for w in wins:
+        wid = (w.get("app_id") or "").lower()
+        if wid and wid in targets:
+            found.append((1, w))
+        elif "." in clean and wid == clean.rsplit(".", 1)[-1]:
+            found.append((2, w))
+        elif wid and (wid.startswith(clean) or clean.startswith(wid)):
+            found.append((3, w))
+        elif binary and not entry.get("Terminal") == "true" and (w["_comm"] == binary or (wid and binary in wid)):
+            found.append((4, w))
+    found.sort(key=lambda m: m[0])
+    return [w for _, w in found]
+
+
+# ── usage counts ──────────────────────────────────────────────────────────────
+def counts():
+    result = {}
+    try:
+        with open(STATE) as f:
+            for line in f:
+                app_id, _, n = line.rstrip("\n").partition("\t")
+                result[app_id] = int(n or 0)
+    except (OSError, ValueError):
+        pass
+    return result
+
+
+def bump(app_id):
+    c = counts()
+    c[app_id] = c.get(app_id, 0) + 1
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE + ".tmp", "w") as f:
+            f.writelines(f"{k}\t{v}\n" for k, v in c.items())
+        os.replace(STATE + ".tmp", STATE)
+    except OSError:
+        pass
+
+
+# ── modes ─────────────────────────────────────────────────────────────────────
+def launch_window():
+    import subprocess
+    if subprocess.run(["pkill", "-f", "^kitty --class app-search"]).returncode == 0:
+        return  # second press closes the launcher
+    os.execvp("kitty", [*KITTY, SELF, "--ui"])
+
+
+def list_apps():
+    apps, wins, used = all_apps(), windows(), counts()
+    icons = icon_ids(apps)
+    rows = []
+    for app_id, (_, e) in apps.items():
+        running = bool(matching(wins, app_id, e))
+        cats = e.get("Categories", "").split(";")
+        glyph, colour = next(((g, c) for cat, g, c in ICONS if cat in cats), DEFAULT_ICON)
+        about = e.get("GenericName") or e.get("Comment") or ""
+        if about.lower() == e["Name"].lower():
+            about = e.get("Comment", "")
+        dot = f"{CYAN}●{RST}" if running else " "
+        if app_id in icons:  # the real icon: two cells that kitty fills with the image
+            picture = f"\033[38;2;0;0;{icons[app_id][0]}m{PLACEHOLDER}{PLACEHOLDER}{RST}"
+        else:
+            picture = f"{colour}{glyph} "
+        text = f"{dot} {picture}  {FG}{e['Name']:<26} {DIM}{about}{RST}"
+        rows.append((-used.get(app_id, 0), e["Name"].lower(), f"{app_id}\t{text}"))
+    rows.sort()
+    sys.stdout.write("\n".join(r[2] for r in rows) + "\n")
+
+
+def ui():
+    for var in ("FZF_DEFAULT_OPTS", "FZF_DEFAULT_OPTS_FILE", "FZF_DEFAULT_COMMAND"):
+        os.environ.pop(var, None)
+    os.environ["FZF_DEFAULT_COMMAND"] = f"{SELF} --list"
+    footer = f"{CYAN}enter{DIM} open or focus   {CYAN}ctrl/shift+enter{DIM} new instance   {CYAN}●{DIM} running"
+    os.execvp("fzf", [
+        "fzf", "--ansi", "--delimiter", "\t", "--with-nth", "2", "--no-multi", "--tiebreak", "index",
+        "--query", os.environ.get("APP_SEARCH_QUERY", ""),
+        "--layout", "reverse", "--no-hscroll", "--info", "inline-right", "--no-scrollbar", "--no-separator", "--gutter", " ",
+        "--prompt", "  ", "--pointer", "▌", "--ghost", "Search your apps",
+        "--input-border", "rounded", "--input-label", " Apps ",
+        "--footer", footer, "--footer-border", "none",
+        "--bind", f"start:execute-silent({SELF} --icons)",
+        "--bind", f"enter:become({SELF} --run {{1}})",
+        "--bind", f"f12:become({SELF} --new {{1}})",
+        "--bind", "tab:down,shift-tab:up", "--cycle",
+        "--color", "dark,bg:-1,fg:#a6accd,hl:#84ffff,bg+:#1f2233,fg+:#eeffff,hl+:#84ffff",
+        "--color", "gutter:-1,pointer:#84ffff,prompt:#84ffff,query:#eeffff,ghost:#464b5d",
+        "--color", "info:#464b5d,spinner:#c792ea,border:#232637,input-border:#3b3f51",
+        "--color", "label:#84ffff,footer:#676e95",
+    ])
+
+
+def start(app_id, entry, new_instance):
+    import subprocess
+    argv = command(entry)
+    if not argv:
+        return
+    if entry.get("Terminal") == "true":
+        argv = ["kitty", "-e", *argv]
+    elif new_instance:
+        hay = (argv[0] + " " + app_id).lower()
+        browsers = ("chrome", "chromium", "brave", "vivaldi", "firefox", "edge", "opera", "nautilus", "code")
+        if any(b in hay for b in browsers) and "--new-window" not in argv:
+            argv.append("--new-window")
+    # we are running inside the launcher's kitty: don't leak its terminal settings
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("KITTY_", "FZF_")) and k not in ("TERM", "TERMINFO", "COLORTERM", "WINDOWID", "APP_SEARCH_QUERY")}
+    cwd = entry.get("Path") or HOME
+    try:
+        subprocess.Popen(argv, cwd=cwd if os.path.isdir(cwd) else HOME, env=env, start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as err:
+        subprocess.run(["notify-send", "app-search", f"Could not start {entry.get('Name')}: {err}"])
+
+
+def run(app_id, new_instance):
+    import subprocess
+    if not app_id:
+        return
+    apps = all_apps()
+    if app_id not in apps:
+        return
+    _, entry = apps[app_id]
+    bump(app_id)
+    found = [] if new_instance else matching(windows(), app_id, entry)
+    if not found:
+        start(app_id, entry, new_instance)
+        return
+    # already running: cycle if one of its windows is focused, else most recent
+    focused = next((i for i, w in enumerate(found) if w.get("is_focused")), None)
+    if focused is not None and len(found) > 1:
+        target = found[(focused + 1) % len(found)]
+    else:
+        def recency(w):
+            ts = w.get("focus_timestamp") or {}
+            return (ts.get("secs", 0), ts.get("nanos", 0))
+        target = max(found, key=recency)
+    subprocess.run(["niri", "msg", "action", "focus-window", "--id", str(target["id"])])
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    arg = sys.argv[2] if len(sys.argv) > 2 else ""
+    if mode == "--ui":
+        ui()
+    elif mode == "--icons":
+        send_icons(icon_ids(all_apps()))
+    elif mode == "--list":
+        list_apps()
+    elif mode == "--run":
+        run(arg, new_instance=False)
+    elif mode == "--new":
+        run(arg, new_instance=True)
+    else:
+        launch_window()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Fuzzy-jump to a running tmux session, or open a project folder as a new one.
+# Typing a name that matches nothing creates a fresh session with that name.
+
+# Folders whose sub-folders count as "projects". Edit to taste.
+ROOTS=("$HOME/Projects" "$HOME/code" "$HOME/builds" "$HOME/.config")
+
+list() {
+    tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -vx scratch | sed 's/^/● /'
+    for r in "${ROOTS[@]}"; do
+        [ -d "$r" ] && find "$r" -mindepth 1 -maxdepth 1 -type d -not -name '.*' 2>/dev/null
+    done | sed "s|^$HOME|~|"
+}
+
+export SHELL=/bin/bash    # fzf runs the preview with $SHELL; the preview is bash syntax
+out=$(list | fzf --print-query --reverse --no-sort --prompt='  ' \
+    --header='enter: go   ● = running session   type a new name to create one' \
+    --preview='x={}; case "$x" in "● "*) tmux capture-pane -ep -t "=${x#● }:" ;; *) ls -A --color=always "${x/#\~/$HOME}" ;; esac' \
+    --preview-window='right,55%,border-left')
+query=$(sed -n 1p <<<"$out")
+pick=$(sed -n 2p <<<"$out")
+choice=${pick:-$query}
+[ -z "$choice" ] && exit 0
+
+dir=$HOME
+case "$choice" in
+    "● "*) name=${choice#● } ;;
+    "~"*|/*) dir=${choice/#\~/$HOME}; name=$(basename "$dir") ;;
+    *) name=$choice ;;
+esac
+name=${name//[.:]/_}      # tmux does not allow . or : in session names
+
+tmux has-session -t "=$name" 2>/dev/null || tmux new-session -ds "$name" -c "$dir"
+if [ -n "$TMUX" ]; then
+    tmux switch-client -t "=$name"
+else
+    tmux attach-session -t "=$name"
+fi

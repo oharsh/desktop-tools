@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+niri-run-or-raise: Intelligent application launcher for Niri and Fuzzel.
+- Pressing Enter: Focuses existing window if running, else launches new instance.
+- Pressing Ctrl+Enter: Always launches a new instance.
+- Also supports --force-new flag (e.g. for Mod+Ctrl+Y).
+"""
+
+import sys
+import os
+import json
+import time
+import subprocess
+import re
+from typing import List, Dict, Optional, Tuple, Any
+
+def get_proc_comm(pid: Optional[int]) -> str:
+    if not pid:
+        return ""
+    try:
+        with open(f"/proc/{pid}/comm", "r", errors="ignore") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+def run_niri_cmd(*args: str) -> Optional[str]:
+    try:
+        res = subprocess.run(["niri", "msg", "action", *args], capture_output=True, text=True, check=True)
+        return res.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error running niri action {args}: {e.stderr}", file=sys.stderr)
+        return None
+
+def get_niri_windows() -> List[Dict[str, Any]]:
+    try:
+        res = subprocess.run(["niri", "msg", "--json", "windows"], capture_output=True, text=True, check=True)
+        return json.loads(res.stdout)
+    except Exception as e:
+        print(f"Error querying niri windows: {e}", file=sys.stderr)
+        return []
+
+def get_niri_workspaces() -> List[Dict[str, Any]]:
+    try:
+        res = subprocess.run(["niri", "msg", "--json", "workspaces"], capture_output=True, text=True, check=True)
+        return json.loads(res.stdout)
+    except Exception as e:
+        print(f"Error querying niri workspaces: {e}", file=sys.stderr)
+        return []
+
+def get_focused_output(workspaces: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    if workspaces is None:
+        workspaces = get_niri_workspaces()
+    focused_ws = next((w for w in workspaces if w.get("is_focused")), None)
+    if not focused_ws:
+        focused_ws = next((w for w in workspaces if w.get("is_active")), None)
+    return focused_ws.get("output") if focused_ws else None
+
+def parse_desktop_file(desktop_path: Optional[str]) -> Dict[str, Optional[str]]:
+    info = {"wmclass": None, "name": None, "exec": None, "tryexec": None}
+    if not desktop_path or not os.path.exists(desktop_path):
+        return info
+    try:
+        with open(desktop_path, "r", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("StartupWMClass=") and not info["wmclass"]:
+                    info["wmclass"] = line.split("=", 1)[1].strip()
+                elif line.startswith("Name=") and not info["name"]:
+                    info["name"] = line.split("=", 1)[1].strip()
+                elif line.startswith("Exec=") and not info["exec"]:
+                    info["exec"] = line.split("=", 1)[1].strip()
+                elif line.startswith("TryExec=") and not info["tryexec"]:
+                    info["tryexec"] = line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return info
+
+def clean_exec_args(argv: List[str]) -> List[str]:
+    cleaned = []
+    field_code_pattern = re.compile(r"^%[a-zA-Z]$")
+    for arg in argv:
+        if field_code_pattern.match(arg):
+            continue
+        cleaned.append(arg)
+    return cleaned
+
+def match_candidate_windows(
+    windows: List[Dict[str, Any]],
+    desktop_id: Optional[str],
+    desktop_path: Optional[str],
+    argv: List[str]
+) -> List[Dict[str, Any]]:
+    dinfo = parse_desktop_file(desktop_path)
+    
+    clean_id = ""
+    if desktop_id:
+        clean_id = desktop_id[:-8] if desktop_id.endswith(".desktop") else desktop_id
+        clean_id = clean_id.strip().lower()
+
+    target_app_ids = set()
+    if clean_id:
+        target_app_ids.add(clean_id)
+    if dinfo["wmclass"]:
+        target_app_ids.add(dinfo["wmclass"].strip().lower())
+
+    binary_name = ""
+    if argv:
+        binary_name = os.path.basename(argv[0]).strip().lower()
+
+    matches = []
+    for w in windows:
+        w_appid = (w.get("app_id") or "").strip().lower()
+        w_title = (w.get("title") or "").strip().lower()
+        w_pid = w.get("pid")
+        w_comm = get_proc_comm(w_pid).lower()
+
+        # Score 1: Exact App ID or StartupWMClass match
+        if w_appid and w_appid in target_app_ids:
+            matches.append((1, w))
+            continue
+
+        # Score 2: Reverse domain last component match (e.g. com.google.Chrome -> chrome)
+        if clean_id and "." in clean_id:
+            last_part = clean_id.split(".")[-1]
+            if last_part and w_appid == last_part:
+                matches.append((2, w))
+                continue
+
+        # Score 3: App ID starts with clean_id or vice versa
+        if clean_id and (w_appid.startswith(clean_id) or clean_id.startswith(w_appid)):
+            matches.append((3, w))
+            continue
+
+        # Score 4: Binary/comm match if no desktop ID or matching binary
+        if binary_name:
+            if w_comm == binary_name or (w_appid and binary_name in w_appid):
+                matches.append((4, w))
+                continue
+
+        # Score 5: Title match against application name
+        if dinfo["name"] and len(dinfo["name"]) >= 4:
+            if dinfo["name"].lower() in w_title:
+                matches.append((5, w))
+                continue
+
+    matches.sort(key=lambda item: item[0])
+    return [w for score, w in matches]
+
+def handle_capture(meta_path: str, raw_argv: List[str]):
+    data = {
+        "desktop_entry_id": os.environ.get("DESKTOP_ENTRY_ID"),
+        "desktop_entry_path": os.environ.get("DESKTOP_ENTRY_PATH"),
+        "desktop_entry_name": os.environ.get("DESKTOP_ENTRY_NAME"),
+        "desktop_entry_action": os.environ.get("DESKTOP_ENTRY_ACTION"),
+        "xdg_activation_token": os.environ.get("XDG_ACTIVATION_TOKEN"),
+        "desktop_startup_id": os.environ.get("DESKTOP_STARTUP_ID"),
+        "cwd": os.getcwd(),
+        "argv": raw_argv,
+    }
+    try:
+        with open(meta_path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Failed to write metadata: {e}", file=sys.stderr)
+    sys.exit(0)
+
+def spawn_application(meta: Dict[str, Any], is_force_new: bool):
+    argv = meta.get("argv") or []
+    cleaned_argv = clean_exec_args(argv)
+    desktop_id = meta.get("desktop_entry_id") or ""
+    desktop_path = meta.get("desktop_entry_path") or ""
+
+    if not cleaned_argv and desktop_id:
+        cleaned_argv = ["gtk-launch", desktop_id]
+
+    if not cleaned_argv:
+        print("No command to spawn", file=sys.stderr)
+        return
+
+    # If forcing a new instance, ensure browser/editor multi-window flags are applied
+    if is_force_new:
+        prog = cleaned_argv[0].lower()
+        if any(b in prog or b in desktop_id.lower() for b in ["chrome", "chromium", "brave", "vivaldi", "firefox", "nautilus", "code"]):
+            if "--new-window" not in cleaned_argv:
+                cleaned_argv.append("--new-window")
+
+    env = os.environ.copy()
+    if meta.get("xdg_activation_token"):
+        env["XDG_ACTIVATION_TOKEN"] = meta["xdg_activation_token"]
+    if meta.get("desktop_startup_id"):
+        env["DESKTOP_STARTUP_ID"] = meta["desktop_startup_id"]
+
+    cwd = meta.get("cwd") or os.path.expanduser("~")
+    try:
+        subprocess.Popen(
+            cleaned_argv,
+            cwd=cwd,
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print(f"Error spawning application {cleaned_argv}: {e}", file=sys.stderr)
+
+def main():
+    # Subcommand: --capture <meta_file> <argv...>
+    if len(sys.argv) >= 3 and sys.argv[1] == "--capture":
+        meta_path = sys.argv[2]
+        raw_argv = sys.argv[3:]
+        handle_capture(meta_path, raw_argv)
+        return
+
+    # Subcommand: --test-match <desktop_id>
+    if len(sys.argv) >= 3 and sys.argv[1] == "--test-match":
+        test_id = sys.argv[2]
+        windows = get_niri_windows()
+        # Find desktop path
+        for p in [f"/usr/share/applications/{test_id}", os.path.expanduser(f"~/.local/share/applications/{test_id}")]:
+            if os.path.exists(p):
+                matches = match_candidate_windows(windows, test_id, p, [test_id])
+                print(f"Matched windows for {test_id}: {[(m['id'], m.get('app_id'), m.get('title')) for m in matches]}")
+                return
+        print(f"Desktop file not found for {test_id}", file=sys.stderr)
+        return
+
+    force_new_cli = False
+    pass_through_args = []
+    for arg in sys.argv[1:]:
+        if arg == "--force-new":
+            force_new_cli = True
+        else:
+            pass_through_args.append(arg)
+
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    meta_path = os.path.join(runtime_dir, f"fuzzel-launch-{os.getpid()}-{int(time.time()*1000)}.json")
+
+    self_script = os.path.abspath(__file__)
+    launch_prefix = f"{self_script} --capture {meta_path}"
+
+    focused_output = get_focused_output()
+    has_output_arg = any(arg == "-o" or arg.startswith("--output") for arg in pass_through_args)
+    extra_fuzzel_args = []
+    if not has_output_arg and focused_output:
+        extra_fuzzel_args.append(f"--output={focused_output}")
+
+    fuzzel_cmd = [
+        "fuzzel",
+        *extra_fuzzel_args,
+        f"--launch-prefix={launch_prefix}",
+        "--override=key-bindings.custom-1=Control+Return Control+KP_Enter",
+        *pass_through_args
+    ]
+
+    try:
+        res = subprocess.run(fuzzel_cmd)
+        fuzzel_exit_code = res.returncode
+    except FileNotFoundError:
+        print("fuzzel not found in PATH", file=sys.stderr)
+        return
+
+    # Fuzzel exit codes:
+    # 0 = normal selection (Enter)
+    # 10 = custom-1 (Control+Return)
+    # 1 or other = cancelled / Escape
+    if fuzzel_exit_code not in (0, 10):
+        if os.path.exists(meta_path):
+            try:
+                os.unlink(meta_path)
+            except OSError:
+                pass
+        return
+
+    is_force_new = force_new_cli or (fuzzel_exit_code == 10)
+
+    # Wait briefly for metadata file to be written if needed
+    meta = None
+    for _ in range(50):
+        if os.path.exists(meta_path) and os.path.getsize(meta_path) > 0:
+            try:
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                break
+            except (json.JSONDecodeError, OSError):
+                time.sleep(0.02)
+        else:
+            time.sleep(0.02)
+
+    if os.path.exists(meta_path):
+        try:
+            os.unlink(meta_path)
+        except OSError:
+            pass
+
+    if not meta:
+        return
+
+    if is_force_new:
+        spawn_application(meta, is_force_new=True)
+        return
+
+    # Normal Enter: Try to raise existing window
+    windows = get_niri_windows()
+    desktop_id = meta.get("desktop_entry_id") or ""
+    desktop_path = meta.get("desktop_entry_path") or ""
+    argv = meta.get("argv") or []
+
+    matches = match_candidate_windows(windows, desktop_id, desktop_path, argv)
+
+    if not matches:
+        # No existing window running -> Launch new instance
+        spawn_application(meta, is_force_new=False)
+        return
+
+    # Existing window(s) found!
+    # If one of the matching windows is ALREADY focused and multiple exist, cycle to next
+    target_window = matches[0]
+    focused_idx = None
+    for idx, w in enumerate(matches):
+        if w.get("is_focused"):
+            focused_idx = idx
+            break
+
+    if focused_idx is not None and len(matches) > 1:
+        next_idx = (focused_idx + 1) % len(matches)
+        target_window = matches[next_idx]
+    else:
+        # Sort matches by:
+        # 1. Windows on the focused workspace / output first
+        # 2. Most recently focused timestamp
+        workspaces = get_niri_workspaces()
+        focused_ws = next((w for w in workspaces if w.get("is_focused")), None)
+        focused_ws_id = focused_ws.get("id") if focused_ws else None
+        ws_output_map = {w["id"]: w.get("output") for w in workspaces}
+
+        def match_sort_key(w):
+            w_ws_id = w.get("workspace_id")
+            w_output = ws_output_map.get(w_ws_id)
+            on_same_ws = (w_ws_id == focused_ws_id)
+            on_same_output = (w_output == focused_output) if (w_output and focused_output) else False
+            location_priority = 2 if on_same_ws else (1 if on_same_output else 0)
+            recency = w.get("focus_timestamp", {}).get("secs", 0)
+            return (location_priority, recency, w.get("id", 0))
+
+        matches.sort(key=match_sort_key, reverse=True)
+        target_window = matches[0]
+
+    target_id = target_window.get("id")
+    if target_id is not None:
+        run_niri_cmd("focus-window", "--id", str(target_id))
+
+if __name__ == "__main__":
+    main()

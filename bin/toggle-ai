@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""
+toggle-ai: Floating scratchpad manager for Claude and Gemini on Niri compositor.
+
+Behaviors:
+1. If the requested AI chat window is not running:
+   - Spawns it with dedicated profile / app mode.
+   - Niri window rules automatically open it floating, centered, with custom size and rounded corners.
+2. If the window is currently visible on the active workspace:
+   - Hides it by moving it to the off-screen bottommost workspace (workspace index 99) without closing the app or losing chat history/drafts.
+   - Restores focus to the next active window on the workspace.
+3. If the window is hidden on another workspace:
+   - Moves it to the currently focused workspace.
+   - Floats, centers, and focuses it immediately.
+"""
+
+import sys
+import json
+import re
+import subprocess
+import os
+
+def run_niri_cmd(*args):
+    try:
+        res = subprocess.run(["niri", "msg", "action", *args], capture_output=True, text=True, check=True)
+        return res.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error running niri action {args}: {e.stderr}", file=sys.stderr)
+        return None
+
+def get_niri_json(subcmd):
+    try:
+        res = subprocess.run(["niri", "msg", "--json", subcmd], capture_output=True, text=True, check=True)
+        return json.loads(res.stdout)
+    except Exception as e:
+        print(f"Error getting niri {subcmd}: {e}", file=sys.stderr)
+        return []
+
+def clean_stale_singleton(user_dir):
+    """Clean up stale Chrome singleton symlinks if Chrome crashed or was terminated."""
+    for stale in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        stale_path = os.path.join(user_dir, stale)
+        if os.path.islink(stale_path) or os.path.exists(stale_path):
+            try:
+                os.unlink(stale_path)
+            except OSError:
+                pass
+
+def toggle(target):
+    target = target.lower()
+    user_dir = None
+    if target == "claude":
+        app_id_regex = r"^com\.anthropic\.Claude$"
+        spawn_cmd = ["claude-desktop"]
+    elif target == "gemini":
+        app_id_regex = r"^chrome-gemini\.google\.com"
+        user_dir = os.path.expanduser("~/.config/gemini-app")
+        spawn_cmd = [
+            "google-chrome-stable",
+            f"--user-data-dir={user_dir}",
+            "--app=https://gemini.google.com"
+        ]
+    elif target in ("todoist", "todoistenhanced", "todoist-enhanced", "week"):
+        app_id_regex = r"^chrome-todoistenhanced\.julesbertolino\.fr"
+        user_dir = os.path.expanduser("~/.config/todoistenhanced-app")
+        os.makedirs(user_dir, exist_ok=True)
+        for marker in ("First Run", "EULA Accepted"):
+            marker_file = os.path.join(user_dir, marker)
+            if not os.path.exists(marker_file):
+                try:
+                    open(marker_file, "a").close()
+                except OSError:
+                    pass
+        spawn_cmd = [
+            "google-chrome-stable",
+            f"--user-data-dir={user_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--app=https://todoistenhanced.julesbertolino.fr/#/week"
+        ]
+    else:
+        print(f"Usage: toggle-ai <claude|gemini|todoist>", file=sys.stderr)
+        sys.exit(1)
+
+    workspaces = get_niri_json("workspaces")
+    windows = get_niri_json("windows")
+
+    # Locate currently focused workspace (prioritizing the monitor that has active keyboard focus)
+    focused_ws = None
+    for ws in workspaces:
+        if ws.get("is_focused"):
+            focused_ws = ws
+            break
+
+    if not focused_ws:
+        for ws in workspaces:
+            if ws.get("is_active"):
+                focused_ws = ws
+                break
+
+    if not focused_ws and workspaces:
+        focused_ws = workspaces[0]
+
+    focused_ws_id = focused_ws.get("id") if focused_ws else None
+    focused_ws_idx = focused_ws.get("idx") if focused_ws else 1
+    focused_output = focused_ws.get("output") if focused_ws else None
+    active_ws_ref = str(focused_ws_idx)
+
+    # Find matching window(s) - strictly match app-id so regular browser tabs are not hijacked
+    candidates = []
+    for win in windows:
+        app_id = win.get("app_id") or ""
+        if re.search(app_id_regex, app_id, re.IGNORECASE):
+            candidates.append(win)
+
+    if not candidates:
+        if user_dir:
+            clean_stale_singleton(user_dir)
+        # Launch fresh instance
+        subprocess.Popen(spawn_cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+
+    # Sort candidates by focus timestamp or id (most recent first)
+    candidates.sort(key=lambda w: (w.get("focus_timestamp", {}).get("secs", 0), w.get("id", 0)), reverse=True)
+    target_win = candidates[0]
+    win_id = target_win["id"]
+    win_ws_id = target_win.get("workspace_id")
+    is_focused = target_win.get("is_focused", False)
+
+    # A scratchpad should hide if it is already focused or visible on the current focused workspace
+    is_on_focused_ws = (focused_ws_id is not None and win_ws_id == focused_ws_id)
+    should_hide = is_focused or is_on_focused_ws
+
+    if should_hide:
+        # Hide window to off-screen workspace (99 targets the bottommost empty workspace)
+        run_niri_cmd("move-window-to-workspace", "--window-id", str(win_id), "--focus", "false", "99")
+        # Restore focus to another window on the current workspace if one exists
+        other_windows = [
+            w for w in windows
+            if w.get("workspace_id") == focused_ws_id and w.get("id") != win_id
+        ]
+        if other_windows:
+            other_windows.sort(key=lambda w: (w.get("focus_timestamp", {}).get("secs", 0), w.get("id", 0)), reverse=True)
+            run_niri_cmd("focus-window", "--id", str(other_windows[0]["id"]))
+    else:
+        # Summon window to current monitor and workspace
+        if focused_output:
+            run_niri_cmd("move-window-to-monitor", "--id", str(win_id), focused_output)
+        run_niri_cmd("move-window-to-workspace", "--window-id", str(win_id), "--focus", "true", active_ws_ref)
+        run_niri_cmd("move-window-to-floating", "--id", str(win_id))
+        run_niri_cmd("center-window", "--id", str(win_id))
+        run_niri_cmd("focus-window", "--id", str(win_id))
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: toggle-ai <claude|gemini|todoist>")
+        sys.exit(1)
+    toggle(sys.argv[1])

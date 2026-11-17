@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# lock        lock the screen (clock, weather, password) — bound to Mod+' and Super+Alt+L
+# lock test   show the lock for 3 seconds, then unlock by itself (no password)
+# Config: ~/.config/quickshell/lock/shell.qml
+pgrep -f '^qs -c lock' >/dev/null && exit 0          # already locked
+screensaver stop 2>/dev/null
+[ "${1-}" = test ] && export LOCK_TEST=1
+exec qs -c lock

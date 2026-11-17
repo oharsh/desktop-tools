@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# file-search — fuzzy file finder in a floating window (bound to Mod+/ in niri).
+#
+#   Enter        open: text → nvim, pdf → zathura, image → gthumb, media → vlc,
+#                folder → Files, anything else → the system default app
+#   Ctrl+Enter   show the file highlighted in Files (nautilus); Shift+Enter does the same
+#   Ctrl+Y       copy the full path
+#   Ctrl+P       toggle the preview
+#   type:query   limit to a kind of file, e.g.  pdf:report  img:  doc:thesis  dir:books
+#                (kinds: pdf doc sheet slides img video audio code text zip dir; any other
+#                word is taken as a file extension, e.g.  sh:backup)
+#   Esc          close        (pressing Mod+/ again also closes it)
+#
+# Colours are Material "deep ocean", the same as nvim and tmux.
+
+self=$(realpath "$0")
+root=$HOME
+
+# Folders that are never worth searching. Add or remove freely.
+excludes=(
+  .git .cache .local/share .local/state node_modules __pycache__ '*.pyc'
+  .cargo .rustup .npm .gemini .dotnet .pki '.vscode*' '.texlive*' '.BurpSuite*' '.copilot*'
+  '.config/google-chrome*' '.config/chromium*' '.config/Code*' '.config/Claude*'
+  '.config/gemini-app*' '.config/BraveSoftware' '.config/microsoft-edge' '.config/vivaldi'
+  '.config/opera' .mozilla '.config/todoist*' '.config/Todoist' .venv venv site-packages
+  '.config/DankMaterialShell/*cache*' .wapiti
+)
+
+have() { command -v "$1" >/dev/null 2>&1; }
+spawn() { setsid -f "$@" >/dev/null 2>&1 </dev/null; }
+
+# ── the window ────────────────────────────────────────────────────────────────
+launch() {
+  # second press of the key closes the picker
+  pkill -f '^kitty --class file-search' && exit 0
+  exec kitty --class file-search --title "File Search" --config NONE \
+    -o font_family="Hack Nerd Font" -o font_size=12 \
+    -o background=#0f111a -o foreground=#a6accd \
+    -o cursor=#84ffff -o cursor_shape=beam -o cursor_blink_interval=0 \
+    -o selection_background=#1f2233 -o selection_foreground=#eeffff \
+    -o color0=#000000 -o color1=#dc6068 -o color2=#abcf76 -o color3=#e6b455 \
+    -o color4=#6e98eb -o color5=#b480d6 -o color6=#71c6e7 -o color7=#eeffff \
+    -o color8=#464b5d -o color9=#f07178 -o color10=#c3e88d -o color11=#ffcb6b \
+    -o color12=#82aaff -o color13=#c792ea -o color14=#89ddff -o color15=#eeffff \
+    -o window_padding_width="10 16" -o confirm_os_window_close=0 \
+    -o enable_audio_bell=no -o update_check_interval=0 \
+    -o 'map ctrl+enter send_text all \x1b[24~' \
+    -o 'map ctrl+kp_enter send_text all \x1b[24~' \
+    -o 'map shift+enter send_text all \x1b[24~' \
+    -o 'map shift+kp_enter send_text all \x1b[24~' \
+    "$self" --ui
+}
+
+# ── the file list: "relative/path <TAB> icon dim/dir/name" ────────────────────
+list() {
+  local args=(--base-directory "$root" --hidden)
+  local e; for e in "${excludes[@]}"; do args+=(-E "$e"); done
+  fd "${args[@]}" | awk \
+    -v i_dir=$'' -v i_file=$'' -v i_text=$'' -v i_code=$'' \
+    -v i_pdf=$'' -v i_img=$'' -v i_vid=$'' -v i_aud=$'' \
+    -v i_zip=$'' -v i_doc=$'' -v i_xls=$'' -v i_ppt=$'' '
+    function rgb(r, g, b) { return "\033[38;2;" r ";" g ";" b "m" }
+    function reg(list, icon, colour,   a, n, k) {
+      n = split(list, a, " "); for (k = 1; k <= n; k++) { I[a[k]] = icon; C[a[k]] = colour }
+    }
+    BEGIN {
+      dim = rgb(103,110,149); fg = rgb(238,255,255); rst = "\033[0m"
+      blue = rgb(130,170,255); green = rgb(195,232,141); red = rgb(240,113,120)
+      purple = rgb(199,146,234); yellow = rgb(255,203,107); orange = rgb(247,140,108)
+      cyan = rgb(137,221,255)
+      reg("txt md rst org log tex bib", i_text, cyan)
+      reg("c h cpp hpp cc py js ts jsx tsx go rs java kt lua sh fish bash zsh rb php cs swift html css scss json yaml yml toml xml ini conf kdl vim sql nix", i_code, green)
+      reg("pdf epub djvu", i_pdf, red)
+      reg("png jpg jpeg gif webp svg bmp ico tiff avif heic", i_img, purple)
+      reg("mp4 mkv webm mov avi flv m4v", i_vid, yellow)
+      reg("mp3 flac wav ogg opus m4a aac", i_aud, yellow)
+      reg("zip tar gz xz zst bz2 7z rar deb iso", i_zip, orange)
+      reg("doc docx odt rtf", i_doc, blue)
+      reg("xls xlsx ods csv tsv", i_xls, green)
+      reg("ppt pptx odp", i_ppt, orange)
+    }
+    {
+      p = $0; isdir = sub(/\/$/, "", p)
+      match(p, /[^\/]*$/); dir = substr(p, 1, RSTART - 1); name = substr(p, RSTART)
+      if (isdir) { icon = i_dir; col = blue }
+      else {
+        ext = ""; if (match(name, /\.[^.]+$/)) ext = tolower(substr(name, RSTART + 1))
+        if (ext in I) { icon = I[ext]; col = C[ext] } else { icon = i_file; col = dim }
+      }
+      printf "%s\t%s%s  %s%s%s%s%s\t%s\n", p, col, icon, dim, dir, (isdir ? blue : fg), name, rst, (isdir ? "d" : "f")
+    }'
+}
+
+# ── the picker ────────────────────────────────────────────────────────────────
+ui() {
+  unset FZF_DEFAULT_OPTS FZF_DEFAULT_OPTS_FILE FZF_DEFAULT_COMMAND
+  local k=$'\033[38;2;132;255;255m' d=$'\033[38;2;103;110;149m'
+  local footer="${k}enter${d} open   ${k}ctrl/shift+enter${d} show in Files   ${k}ctrl+y${d} copy path   ${k}ctrl+p${d} preview"
+  local run=${XDG_RUNTIME_DIR:-/tmp}
+  "$self" --list > "$run/file-search.list"; echo plain > "$run/file-search.mode"
+  fzf < "$run/file-search.list" \
+    --ansi --delimiter '\t' --with-nth 2 --scheme path --no-multi \
+    --query "${FILE_SEARCH_QUERY-}" \
+    --layout reverse --info inline-right --no-scrollbar --no-separator --gutter " " \
+    --prompt $'  ' --pointer '▌' --ghost 'Search your files' \
+    --input-border rounded --input-label ' Files ' \
+    --footer "$footer" --footer-border none \
+    --preview "$self --preview {1}" \
+    --preview-window 'right,45%,border-left' \
+    --bind "enter:become($self --open {1})" \
+    --bind "f12:become($self --reveal {1})" \
+    --bind "ctrl-y:execute-silent($self --copy {1})+abort" \
+    --bind 'ctrl-p:toggle-preview' \
+    --bind "change:transform:$self --on-change {q}" \
+    --bind 'tab:down,shift-tab:up' --cycle \
+    --color 'dark,bg:-1,fg:#a6accd,hl:#84ffff,bg+:#1f2233,fg+:#eeffff,hl+:#84ffff' \
+    --color 'gutter:-1,pointer:#84ffff,prompt:#84ffff,query:#eeffff,ghost:#464b5d' \
+    --color 'info:#464b5d,spinner:#c792ea,border:#232637,input-border:#3b3f51' \
+    --color 'label:#84ffff,preview-border:#232637,footer:#676e95'
+}
+
+# ── preview pane ──────────────────────────────────────────────────────────────
+show_image() {
+  kitty icat --clear --transfer-mode=memory --unicode-placeholder --stdin=no \
+    --place="${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}@0x0" "$1" | sed '$d' | sed $'$s/$/\e[m/'
+}
+
+preview() {
+  local f="$root/$1" lines=${FZF_PREVIEW_LINES:-40}
+  if [[ -d $f ]]; then
+    ls -A --color=always --group-directories-first "$f" | head -n "$lines"
+    return
+  fi
+  [[ -e $f ]] || return
+  local mime; mime=$(file -Lb --mime-type -- "$f")
+  case $mime in
+    image/*)
+      show_image "$f" ;;
+    application/pdf)
+      local cache="${XDG_CACHE_HOME:-$HOME/.cache}/file-search" key
+      key=$(printf '%s' "$f$(stat -c %Y -- "$f")" | md5sum | cut -c1-32)
+      mkdir -p "$cache"
+      [[ -f $cache/$key.png ]] || pdftoppm -f 1 -l 1 -r 70 -png -singlefile -- "$f" "$cache/$key" 2>/dev/null
+      if [[ -f $cache/$key.png ]]; then show_image "$cache/$key.png"
+      else pdftotext -l 2 -layout -- "$f" - 2>/dev/null | head -n "$lines"; fi ;;
+    *)
+      if [[ $(file -Lb --mime-encoding -- "$f") != binary ]]; then
+        head -c 65536 -- "$f" | head -n "$lines" | expand -t 4
+      else
+        printf '\033[38;2;132;255;255m%s\033[0m\n\n' "${f##*/}"
+        file -Lb -- "$f" | fold -s -w "${FZF_PREVIEW_COLUMNS:-60}"
+        printf '\n%s   %s\n' "$(du -h -- "$f" | cut -f1)" "$(date -r "$f" '+%d %b %Y  %H:%M')"
+      fi ;;
+  esac
+}
+
+# ── actions ───────────────────────────────────────────────────────────────────
+open() {
+  [[ -n $1 ]] || exit 0
+  local f="$root/$1"
+  [[ -e $f ]] || exit 0
+  if [[ -d $f ]]; then
+    if have nautilus; then spawn "$self" --files "$f" "$f"; else spawn xdg-open "$f"; fi
+    return
+  fi
+  local mime; mime=$(file -Lb --mime-type -- "$f")
+  case $mime in
+    application/pdf)
+      if have zathura; then spawn zathura "$f"; else spawn xdg-open "$f"; fi ;;
+    image/*)
+      if have gthumb; then spawn gthumb "$f"; else spawn xdg-open "$f"; fi ;;
+    video/* | audio/*)
+      if have vlc; then spawn vlc "$f"; else spawn xdg-open "$f"; fi ;;
+    *)
+      if [[ $(file -Lb --mime-encoding -- "$f") != binary ]]; then
+        spawn kitty --directory "$(dirname "$f")" nvim "$f"     # any text file
+      else
+        spawn xdg-open "$f"
+      fi ;;
+  esac
+}
+
+reveal() {
+  [[ -n $1 && -e $root/$1 ]] || exit 0
+  if have nautilus; then spawn "$self" --files "$(dirname "$root/$1")" --select "$root/$1"
+  else spawn xdg-open "$(dirname "$root/$1")"; fi
+}
+
+# Run nautilus, then make sure its window really gets focus. When the folder is
+# already open, nautilus only highlights the file inside its existing window and
+# niri leaves you where you were (very visible from a fullscreen app). So: focus
+# the new window if one appears, otherwise the existing window showing that folder
+# — on whichever workspace or monitor it lives.
+#   $1 = folder being shown, rest = arguments for nautilus
+files() {
+  python3 - "$@" <<'PY'
+import json, os, subprocess, sys, time
+
+folder, args = sys.argv[1], sys.argv[2:]
+
+def windows():
+    try:
+        out = subprocess.run(["niri", "msg", "--json", "windows"], capture_output=True, text=True, timeout=2).stdout
+        return [w for w in json.loads(out) if (w.get("app_id") or "").lower() == "org.gnome.nautilus"]
+    except Exception:
+        return []
+
+def recency(w):
+    ts = w.get("focus_timestamp") or {}
+    return (ts.get("secs", 0), ts.get("nanos", 0))
+
+def focus(w):
+    subprocess.run(["niri", "msg", "action", "focus-window", "--id", str(w["id"])], capture_output=True)
+
+before = {w["id"] for w in windows()}
+subprocess.Popen(["nautilus", *args], start_new_session=True,
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+name = os.path.basename(folder.rstrip("/"))
+start, raised_existing = time.monotonic(), False
+while time.monotonic() - start < 4:
+    time.sleep(0.1)
+    current = windows()
+    fresh = [w for w in current if w["id"] not in before]
+    if fresh:                                   # nautilus opened a new window
+        focus(max(fresh, key=lambda w: w["id"]))
+        break
+    old = [w for w in current if w["id"] in before]
+    if old and not raised_existing and time.monotonic() - start > 0.6:
+        showing = [w for w in old if (w.get("title") or "") == name]
+        focus(max(showing or old, key=recency))  # reused window: raise it
+        raised_existing = True
+    if raised_existing and time.monotonic() - start > 2:
+        break
+PY
+}
+
+# ── "kind:query" filtering ────────────────────────────────────────────────────
+# Typing  pdf:report  switches fzf to a pre-filtered list (fuzzy matching on "report" only
+# among PDFs). The prefix is not matched as text, so fzf's own search is turned off while
+# a prefix is present and we run `fzf --filter` ourselves. Plain queries use fzf normally.
+kind_re='^([A-Za-z0-9]+):(.*)$'
+
+filter() {
+  local q=$1 kind rest list=${XDG_RUNTIME_DIR:-/tmp}/file-search.list
+  [[ $q =~ $kind_re ]] || return
+  kind=${BASH_REMATCH[1],,}; rest=${BASH_REMATCH[2]}
+  awk -F'\t' -v kind="$kind" '
+    BEGIN {
+      g["pdf"]="pdf"; g["doc"]="doc docx odt rtf"; g["sheet"]="xls xlsx ods csv tsv"
+      g["slides"]="ppt pptx odp"; g["img"]="png jpg jpeg gif webp svg bmp ico tiff avif heic"
+      g["image"]=g["img"]; g["video"]="mp4 mkv webm mov avi flv m4v"; g["vid"]=g["video"]
+      g["audio"]="mp3 flac wav ogg opus m4a aac"
+      g["code"]="c h cpp hpp cc py js ts jsx tsx go rs java kt lua sh fish bash zsh rb php cs swift html css scss json yaml yml toml xml ini conf kdl vim sql nix"
+      g["text"]="txt md rst org log tex bib"; g["txt"]=g["text"]
+      g["zip"]="zip tar gz xz zst bz2 7z rar deb iso"; g["archive"]=g["zip"]
+      n = split((kind in g) ? g[kind] : kind, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1
+    }
+    kind == "dir" || kind == "folder" { if ($3 == "d") print; next }
+    $3 == "d" { next }
+    { name = $1; sub(/.*\//, "", name)
+      if (match(name, /\.[^.]+$/) && (tolower(substr(name, RSTART + 1)) in ok)) print }
+  ' "$list" | { if [[ -n $rest ]]; then
+      fzf --filter "$rest" --ansi --delimiter '\t' --with-nth 2 --scheme path 2>/dev/null
+      else cat; fi; }
+}
+
+# fzf "change" hook: prints the actions fzf should run for the new query.
+on_change() {
+  local q=$1 run=${XDG_RUNTIME_DIR:-/tmp} mode
+  mode=$(<"$run/file-search.mode")
+  if [[ $q =~ $kind_re ]]; then
+    echo filtered > "$run/file-search.mode"
+    printf 'disable-search+reload(%q --filter %q)' "$self" "$q"
+  elif [[ $mode == filtered ]]; then
+    echo plain > "$run/file-search.mode"
+    printf 'enable-search+reload(cat %q)' "$run/file-search.list"
+  fi
+}
+
+case ${1-} in
+  --filter)    filter "${2-}" ;;
+  --on-change) on_change "${2-}" ;;
+  --ui)      ui ;;
+  --list)    list ;;
+  --preview) preview "${2-}" ;;
+  --open)    open "${2-}" ;;
+  --reveal)  reveal "${2-}" ;;
+  --files)   shift; files "$@" ;;
+  --copy)    printf '%s' "$root/${2-}" | wl-copy ;;
+  *)         launch ;;
+esac

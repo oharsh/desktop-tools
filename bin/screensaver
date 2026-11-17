@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# screensaver [toggle|start|stop] — talks to the Quickshell screensaver
+# (~/.config/quickshell/screensaver/shell.qml), starting it first if needed.
+action=${1:-toggle}
+qs -c screensaver ipc call saver "$action" 2>/dev/null && exit 0
+[ "$action" = stop ] && exit 0
+pgrep -f '^qs -c screensaver' >/dev/null || qs -c screensaver -d >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 0.2
+  qs -c screensaver ipc call saver start 2>/dev/null && exit 0
+done
+exit 1

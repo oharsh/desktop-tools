@@ -1,0 +1,6 @@
+*.bak*
+*.backup*
+*.pre-repo
+config.kdl.pre-*
+__pycache__/
+tmux/plugins/
